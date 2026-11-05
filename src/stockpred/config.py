@@ -33,6 +33,7 @@ class RiskConfig:
     max_positions: int = 8
     max_sector_pct: float = 0.25
     max_drawdown_halt: float = 0.15
+    halt_cooldown_days: int = 20
     vol_target: float | None = None
 
 
@@ -60,6 +61,24 @@ class ModelConfig:
 
 
 @dataclass
+class EvaluationConfig:
+    """Pass/fail gates for `stockpred evaluate`. Fix these before looking at results."""
+
+    controls: int = 20                 # Permuted-score control backtests.
+    seed: int = 0
+    max_leak_ic: float = 0.01          # Shuffled-label |mean rank IC| must stay below this.
+    max_leak_auc_dev: float = 0.01     # Shuffled-label |AUC - 0.5| must stay below this.
+    min_rank_ic: float = 0.02
+    min_ic_tstat: float = 2.0
+    control_percentile: float = 0.95   # Strategy Sharpe must beat this share of controls.
+    stress_cost_mult: float = 2.0
+    min_stress_sharpe: float = 0.0
+    min_sweep_positive_frac: float = 0.75  # Share of sweep cells with Sharpe > 0.
+    max_drawdown: float = 0.25
+    min_trades: int = 100
+
+
+@dataclass
 class Config:
     data: dict[str, Any]
     universe: dict[str, str]
@@ -69,6 +88,7 @@ class Config:
     costs: CostConfig
     sweep: dict[str, list[float]]
     paths: dict[str, str]
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     @property
     def benchmark(self) -> str:
@@ -106,4 +126,5 @@ def load_config(path: str | Path | None = None) -> Config:
         costs=_build(CostConfig, raw.get("costs")),
         sweep=raw.get("sweep", {}),
         paths=raw.get("paths", {}),
+        evaluation=_build(EvaluationConfig, raw.get("evaluation")),
     )

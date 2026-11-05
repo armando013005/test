@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,11 +12,27 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 COLUMNS = ["open", "high", "low", "close", "volume"]
+# Actual shares per split-adjusted share at each date. Prices from Yahoo are
+# split-adjusted, so per-share commissions must divide share counts by this.
+OPTIONAL_COLUMNS = ["split_factor"]
+
+
+def split_factor(splits: pd.Series) -> pd.Series:
+    """Product of the split ratios that happen after each date.
+
+    `splits` holds the ratio on each ex-date (10.0 for a 10-for-1 split) and
+    0 or NaN elsewhere. On and after an ex-date prices are already post-split,
+    so that split is excluded. Actual price = adjusted price * factor.
+    """
+    ratios = splits.fillna(0.0).replace(0.0, 1.0).astype(float)
+    after = ratios.iloc[::-1].cumprod().iloc[::-1].shift(-1)
+    return after.fillna(1.0).rename("split_factor")
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
     """Drops bad rows and enforces OHLC consistency."""
-    df = df[COLUMNS].astype(float).copy()
+    keep = COLUMNS + [c for c in OPTIONAL_COLUMNS if c in df.columns]
+    df = df[keep].astype(float).copy()
     df = df[~df.index.duplicated(keep="last")].sort_index()
     df = df.dropna(subset=["open", "high", "low", "close"])
     df = df[(df["close"] > 0) & (df["open"] > 0)]
@@ -32,7 +49,7 @@ def fetch_yfinance(ticker: str, start: str, end: str | None = None) -> pd.DataFr
     import yfinance as yf
 
     raw = yf.download(
-        ticker, start=start, end=end, auto_adjust=True, actions=False, progress=False, threads=False
+        ticker, start=start, end=end, auto_adjust=True, actions=True, progress=False, threads=False
     )
     if raw is None or raw.empty:
         raise ValueError(f"No data returned for {ticker}")
@@ -41,6 +58,8 @@ def fetch_yfinance(ticker: str, start: str, end: str | None = None) -> pd.DataFr
     raw = raw.rename(columns=str.lower)
     if raw.index.tz is not None:
         raw.index = raw.index.tz_localize(None)
+    splits = raw["stock splits"] if "stock splits" in raw.columns else pd.Series(0.0, index=raw.index)
+    raw["split_factor"] = split_factor(splits)
     return clean(raw)
 
 
@@ -55,17 +74,32 @@ def save(df: pd.DataFrame, cache_dir: str | Path, ticker: str) -> None:
 
 
 def fetch_universe(
-    tickers: list[str], start: str, cache_dir: str | Path, end: str | None = None
+    tickers: list[str],
+    start: str,
+    cache_dir: str | Path,
+    end: str | None = None,
+    retries: int = 3,
+    pause: float = 0.5,
 ) -> list[str]:
-    """Downloads every ticker to the cache. Returns the tickers that failed."""
+    """Downloads every ticker to the cache. Returns the tickers that failed.
+
+    Each ticker gets `retries` attempts with exponential backoff, because
+    Yahoo rate-limits bursts of requests.
+    """
     failed = []
     for ticker in tickers:
-        try:
-            save(fetch_yfinance(ticker, start, end), cache_dir, ticker)
-            log.info("Fetched %s", ticker)
-        except Exception as exc:  # Network and vendor errors vary widely.
-            log.warning("Failed to fetch %s: %s", ticker, exc)
-            failed.append(ticker)
+        for attempt in range(retries):
+            try:
+                save(fetch_yfinance(ticker, start, end), cache_dir, ticker)
+                log.info("Fetched %s", ticker)
+                break
+            except Exception as exc:  # Network and vendor errors vary widely.
+                if attempt == retries - 1:
+                    log.warning("Failed to fetch %s after %d attempts: %s", ticker, retries, exc)
+                    failed.append(ticker)
+                else:
+                    time.sleep(2.0 * 2**attempt)
+        time.sleep(pause)
     return failed
 
 
@@ -92,6 +126,8 @@ def load_universe(
             log.warning("Skipping %s: not cached", ticker)
             continue
         df = clean(pd.read_parquet(path))
+        if "split_factor" not in df.columns:
+            df["split_factor"] = 1.0  # Caches written before split tracking.
         df = df[df.index.isin(calendar)]
         if len(df) < min_history_days:
             log.warning("Skipping %s: only %d rows", ticker, len(df))
@@ -103,6 +139,21 @@ def load_universe(
             continue
         prices[ticker] = df
     return prices
+
+
+def drop_partial_session(
+    prices: dict[str, pd.DataFrame], now: pd.Timestamp | None = None
+) -> dict[str, pd.DataFrame]:
+    """Drops today's bar until the US session has closed and settled (16:15 New York).
+
+    Yahoo serves today's bar while the market is open, and scoring it would
+    treat an intraday price as a close.
+    """
+    now = now if now is not None else pd.Timestamp.now(tz="America/New_York")
+    if (now.hour, now.minute) >= (16, 15):
+        return prices
+    today = pd.Timestamp(now.date())
+    return {t: df[df.index < today] for t, df in prices.items()}
 
 
 def synthetic_prices(

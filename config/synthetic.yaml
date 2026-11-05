@@ -1,0 +1,50 @@
+# Offline check of the evaluation gate on fake prices. It must PASS when an
+# edge is planted and FAIL on pure noise:
+#   stockpred --config config/synthetic.yaml fetch --synthetic --days 2600 --autocorr -0.5
+#   stockpred --config config/synthetic.yaml train
+#   stockpred --config config/synthetic.yaml train --shuffle-labels
+#   stockpred --config config/synthetic.yaml evaluate
+# Repeat with --autocorr 0 for the noise case.
+
+data:
+  cache_dir: data/synthetic
+
+universe:
+  SPY: ETF
+  S00: A
+  S01: A
+  S02: A
+  S03: A
+  S04: B
+  S05: B
+  S06: B
+  S07: B
+  S08: C
+  S09: C
+  S10: C
+  S11: C
+  S12: D
+  S13: D
+  S14: D
+  S15: D
+  S16: E
+  S17: E
+  S18: E
+  S19: E
+
+model:
+  lgbm:
+    n_estimators: 100
+    learning_rate: 0.05
+    num_leaves: 15
+    max_depth: 4
+    min_child_samples: 100
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 5.0
+    verbose: -1
+
+paths:
+  artifacts: artifacts/synthetic
+  state: state/synthetic.json

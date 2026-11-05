@@ -38,6 +38,7 @@ class MarketData:
     market_above_sma200: pd.Series
     market_vol: pd.Series
     benchmark_close: pd.Series
+    split_factor: pd.DataFrame | None = None   # Actual shares per adjusted share; None means 1.
 
     @classmethod
     def from_prices(cls, prices: dict[str, pd.DataFrame], benchmark: str) -> "MarketData":
@@ -47,7 +48,11 @@ class MarketData:
         def wide(source, col):
             return pd.DataFrame({t: source[t][col] for t in prices}).sort_index()
 
+        split = pd.DataFrame(
+            {t: df["split_factor"] if "split_factor" in df else pd.Series(1.0, index=df.index) for t, df in prices.items()}
+        ).sort_index()
         return cls(
+            split_factor=split,
             open=wide(prices, "open"),
             high=wide(prices, "high"),
             low=wide(prices, "low"),
@@ -68,7 +73,8 @@ class Position:
     sector: str
     shares: int
     entry_date: pd.Timestamp
-    entry_price: float
+    entry_ref: float          # Open price before costs.
+    entry_price: float        # Fill price after spread and slippage.
     entry_commission: float
     stop: float
     highest_close: float
@@ -92,9 +98,14 @@ def run_backtest(
     risk: RiskConfig,
     costs: CostConfig,
 ) -> BacktestResult:
-    """Simulates the strategy on dates covered by the out-of-sample predictions."""
+    """Simulates the strategy over the price calendar spanned by the predictions.
+
+    Days without a prediction still run stops and marks; they just can't
+    trigger model-based entries or exits.
+    """
     cost = CostModel(costs)
-    dates = p_up.index.intersection(md.close.index).sort_values()
+    calendar = md.close.index.sort_values()
+    dates = calendar[(calendar >= p_up.index.min()) & (calendar <= p_up.index.max())]
     if len(dates) < 2:
         raise ValueError("Need at least two dates of predictions.")
     p_up = p_up.reindex(index=dates, columns=md.close.columns)
@@ -103,6 +114,10 @@ def run_backtest(
     o, h, l, c = (f.reindex(dates).to_numpy() for f in (md.open, md.high, md.low, md.close))
     atr = md.atr.reindex(dates).to_numpy()
     adv = md.adv.reindex(dates).to_numpy()
+    if md.split_factor is not None:
+        splits = md.split_factor.reindex(index=dates, columns=md.close.columns).fillna(1.0).to_numpy()
+    else:
+        splits = np.ones_like(c, dtype=float)
     probs = p_up.to_numpy()
     sig = signals.to_numpy()
     mvol = md.market_vol.reindex(dates).to_numpy()
@@ -112,16 +127,19 @@ def run_backtest(
     cash = risk.initial_equity
     positions: dict[str, Position] = {}
     pending_exits: dict[str, str] = {}
-    pending_entries: list[tuple[str, int, float]] = []  # (ticker, shares, ATR at signal)
+    pending_entries: list[tuple[str, int, float, float]] = []  # (ticker, shares, ATR, close) at signal
     guard = DrawdownGuard(risk)
     trades, daily = [], []
 
     def close_position(pos: Position, ref_price: float, date, reason: str, j: int) -> None:
         nonlocal cash
-        atr_pct = atr[i, j] / ref_price if np.isfinite(atr[i, j]) else np.nan
-        fill = cost.fill("sell", ref_price, pos.shares, adv[i, j], atr_pct)
+        k = i - 1 if i > 0 else 0  # Cost inputs from the prior close, known before the fill.
+        atr_pct = atr[k, j] / ref_price if np.isfinite(atr[k, j]) else np.nan
+        fill = cost.fill("sell", ref_price, pos.shares, adv[k, j], atr_pct, splits[i, j])
         cash += pos.shares * fill.price - fill.commission
-        gross = (ref_price - pos.entry_price) * pos.shares
+        # Gross uses prices before costs on both legs, so `costs` covers entry
+        # and exit spread, slippage, and commissions.
+        gross = (ref_price - pos.entry_ref) * pos.shares
         net = (fill.price - pos.entry_price) * pos.shares - fill.commission - pos.entry_commission
         trades.append(
             {
@@ -149,29 +167,46 @@ def run_backtest(
                 close_position(positions[ticker], o[i, j], date, reason, j)
         pending_exits = {t: r for t, r in pending_exits.items() if t in positions}
 
-        for ticker, shares, atr_sig in pending_entries:
+        prev_equity = daily[-1]["equity"] if daily else risk.initial_equity
+        for ticker, shares, atr_sig, close_sig in pending_entries:
             j = col[ticker]
             if ticker in positions or not np.isfinite(o[i, j]):
                 continue
-            atr_pct = atr_sig / o[i, j]
-            fill = cost.fill("buy", o[i, j], shares, adv[i, j], atr_pct)
-            affordable = int((cash - fill.commission) // fill.price)
-            if affordable < shares:
-                shares = affordable
-                if shares <= 0:
-                    continue
-                fill = cost.fill("buy", o[i, j], shares, adv[i, j], atr_pct)
+            if len(positions) >= risk.max_positions:  # A queued exit failed to fill.
+                continue
+            sector = sectors.get(ticker, "Unknown")
+            sector_now = sum(p.shares * p.last_close for p in positions.values() if p.sector == sector)
+            k = i - 1 if i > 0 else 0
+            atr_pct = atr_sig / close_sig
+            fill = cost.fill("buy", o[i, j], shares, adv[k, j], atr_pct, splits[i, j])
+            # Re-clip at the fill: an overnight gap can push a position past its caps.
+            limit = min(
+                shares,
+                int((cash - fill.commission) // fill.price),
+                int(prev_equity * risk.max_position_pct // fill.price),
+                int(max(prev_equity * risk.max_sector_pct - sector_now, 0.0) // fill.price),
+            )
+            if limit <= 0:
+                continue
+            if limit < shares:
+                shares = limit
+                fill = cost.fill("buy", o[i, j], shares, adv[k, j], atr_pct, splits[i, j])
             cash -= shares * fill.price + fill.commission
+            # The stop is anchored to the signal close, because a live order's
+            # attached stop is priced before the fill is known. A gap below it
+            # stops out at the open, as a live stop would trigger at once.
+            stop = initial_stop(close_sig, atr_sig, strategy)
             positions[ticker] = Position(
                 ticker=ticker,
-                sector=sectors.get(ticker, "Unknown"),
+                sector=sector,
                 shares=shares,
                 entry_date=date,
+                entry_ref=o[i, j],
                 entry_price=fill.price,
                 entry_commission=fill.commission,
-                stop=initial_stop(fill.price, atr_sig, strategy),
-                highest_close=fill.price,
-                last_close=fill.price,
+                stop=stop,
+                highest_close=close_sig,
+                last_close=o[i, j],
             )
         pending_entries = []
 
@@ -188,11 +223,15 @@ def run_backtest(
         # 3. Close: mark to market, trail stops, queue exits.
         for ticker, pos in positions.items():
             j = col[ticker]
+            pos.days_held += 1  # Trading days, counted even without a bar, as live does.
             if np.isfinite(c[i, j]):
                 pos.last_close = c[i, j]
                 pos.highest_close = max(pos.highest_close, c[i, j])
-                pos.days_held += 1
                 pos.stop = trailing_stop(pos.stop, pos.highest_close, atr[i, j], strategy)
+                if c[i, j] <= pos.stop:
+                    # The stop ratcheted above the close. Live sells at the next open.
+                    pending_exits[ticker] = "stop_close"
+                    continue
             reason = exit_reason(pos.days_held, probs[i, j], strategy)
             if reason:
                 pending_exits[ticker] = reason
@@ -225,7 +264,11 @@ def run_backtest(
             for j in np.argsort(-np.nan_to_num(probs[i], nan=-1.0))
             if sig[i, j] and tickers[j] not in positions
         ]
-        for ticker in candidates[:slots]:
+        # Walk the whole ranking: a candidate rejected by a cap must not waste a
+        # slot. live.plan_orders fills slots the same way.
+        for ticker in candidates:
+            if slots <= 0:
+                break
             j = col[ticker]
             price, a = c[i, j], atr[i, j]
             if not (np.isfinite(price) and np.isfinite(a) and a > 0):
@@ -242,9 +285,10 @@ def run_backtest(
             )
             if shares <= 0:
                 continue
-            pending_entries.append((ticker, shares, a))
+            pending_entries.append((ticker, shares, a, price))
             sector_exposure[sector] = sector_exposure.get(sector, 0.0) + shares * price
             free_cash -= shares * price * 1.002
+            slots -= 1
 
     # Liquidate at the final close so every trade is realized.
     last = len(dates) - 1

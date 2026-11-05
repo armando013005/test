@@ -22,6 +22,7 @@ class Holding:
     signal_date: str      # Close that generated the entry; the fill is the next open.
     stop: float
     highest_close: float
+    split_basis: float = 1.0  # Data's split_factor at signal_date when stop and high were last set.
 
 
 @dataclass
@@ -78,15 +79,16 @@ def plan_orders(
     holdings: dict[str, Holding],
     equity: float,
     cash: float,
-    peak_equity: float,
+    peak_equity: float | DrawdownGuard,
     cfg: Config,
     blackout: set[str] | None = None,
 ) -> tuple[list[Order], dict[str, Holding], float]:
     """Applies exits, stop updates, and entries to the latest close.
 
     `snapshot` is indexed by ticker and holds p_up, exp_ret, and the feature
-    columns for the last trading day. Returns orders, the updated holdings,
-    and the updated peak equity.
+    columns for the last trading day. `peak_equity` is a peak or a
+    DrawdownGuard; a guard is updated in place, so the caller can save its
+    halted-day count. Returns orders, the updated holdings, and the peak.
     """
     s, r = cfg.strategy, cfg.risk
     blackout = blackout or set()
@@ -97,6 +99,10 @@ def plan_orders(
 
     for ticker, h in holdings.items():
         if ticker not in snapshot.index:
+            if days_held(calendar, h.signal_date) >= s.time_stop_days:
+                # The time stop needs no price, so it still applies, as in the backtest.
+                orders.append(Order("sell", ticker, h.shares, h.highest_close, reason="time_stop"))
+                continue
             log.warning("No data for held %s; leaving it untouched", ticker)
             keep[ticker] = h
             continue
@@ -113,7 +119,7 @@ def plan_orders(
         h.stop = new_stop
         keep[ticker] = h
 
-    guard = DrawdownGuard(r, peak=peak_equity)
+    guard = peak_equity if isinstance(peak_equity, DrawdownGuard) else DrawdownGuard(r, peak=peak_equity)
     if not guard.update(equity):
         log.warning("Drawdown halt: equity %.0f is below %.0f%% of peak %.0f", equity, 100 * (1 - r.max_drawdown_halt), guard.peak)
         return orders, keep, guard.peak
@@ -154,3 +160,33 @@ def holdings_to_json(holdings: dict[str, Holding]) -> dict:
 
 def holdings_from_json(raw: dict) -> dict[str, Holding]:
     return {t: Holding(**h) for t, h in raw.items()}
+
+
+def rescale_for_splits(holdings: dict[str, Holding], prices: dict[str, pd.DataFrame]) -> list[str]:
+    """Converts saved stops and highs to the latest split-adjusted price basis.
+
+    Each run re-downloads split-adjusted history. After a 10-for-1 split, a
+    stop saved as 900 must become 90, or the next run sells on a false stop.
+    Returns the tickers that were rescaled.
+    """
+    changed = []
+    for ticker, h in holdings.items():
+        df = prices.get(ticker)
+        if df is None or "split_factor" not in df:
+            continue
+        upto = df["split_factor"].loc[: pd.Timestamp(h.signal_date)]
+        if upto.empty:
+            continue
+        now = float(upto.iloc[-1])
+        if now > 0 and abs(now / h.split_basis - 1) > 1e-9:
+            scale = h.split_basis / now
+            h.stop *= scale
+            h.highest_close *= scale
+            h.split_basis = now
+            changed.append(ticker)
+    return changed
+
+
+def client_order_id(asof: str, order: Order) -> str:
+    """Stable id per close, ticker, and action, so Alpaca rejects a re-sent duplicate."""
+    return f"sp-{asof}-{order.ticker}-{order.action}"

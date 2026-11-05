@@ -28,9 +28,10 @@ def _artifacts(cfg: Config) -> Path:
 
 def _load_prices(cfg: Config) -> dict[str, pd.DataFrame]:
     d = cfg.data
-    return data.load_universe(
+    prices = data.load_universe(
         list(cfg.universe), d["cache_dir"], cfg.benchmark, d.get("min_history_days", 600), d.get("max_missing_frac", 0.02)
     )
+    return data.drop_partial_session(prices)
 
 
 def cmd_fetch(cfg: Config, args) -> None:
@@ -52,7 +53,7 @@ def cmd_train(cfg: Config, args) -> None:
     out = _artifacts(cfg)
     suffix = "_shuffled" if args.shuffle_labels else ""
     preds.to_parquet(out / f"predictions{suffix}.parquet")
-    metrics = oos_metrics(preds)
+    metrics = oos_metrics(preds, cfg.model.horizon)
     with open(out / f"oos_metrics{suffix}.json", "w") as f:
         json.dump(metrics, f, indent=2)
     print("Out-of-sample model quality:")
@@ -82,22 +83,43 @@ def cmd_backtest(cfg: Config, args) -> None:
         print(table.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
 
 
-def _snapshot(cfg: Config) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
+def cmd_evaluate(cfg: Config, args) -> None:
+    from .evaluate import evaluate
+
+    out = _artifacts(cfg)
+    preds_path = Path(args.predictions or out / "predictions.parquet")
+    shuffled_path = Path(args.shuffled or out / "predictions_shuffled.parquet")
+    for path, cmd in ((preds_path, "stockpred train"), (shuffled_path, "stockpred train --shuffle-labels")):
+        if not path.exists():
+            raise SystemExit(f"{path} not found. Run `{cmd}` first.")
+    results = evaluate(
+        cfg, _load_prices(cfg), pd.read_parquet(preds_path), pd.read_parquet(shuffled_path),
+        out / "evaluation", n_controls=args.controls, jobs=args.jobs,
+    )
+    for g in results["gates"]:
+        print(f"  {'PASS' if g['pass'] else 'FAIL'}  {g['gate']:<11} {g['detail']}")
+    print(f"\nVerdict: {results['verdict']}. Report: {out / 'evaluation' / 'report.md'}")
+
+
+def _snapshot(cfg: Config) -> tuple[pd.DataFrame, pd.DatetimeIndex, dict[str, pd.DataFrame]]:
+    model_path = _artifacts(cfg) / "model.joblib"
+    if not model_path.exists():
+        raise SystemExit(f"{model_path} not found. Run `stockpred train` first.")
     prices = _load_prices(cfg)
-    model = joblib.load(_artifacts(cfg) / "model.joblib")
+    model = joblib.load(model_path)
     panel = build_panel(prices, cfg.benchmark, cfg.model)
     calendar = prices[cfg.benchmark].index
     latest = panel.xs(calendar[-1], level="date").dropna(subset=["atr14"])
     scores = model.predict(latest.dropna(subset=model.clf.feature_name_))
     snap = latest.join(scores, how="inner")
     snap["pred_close"] = snap["close"] * (1 + snap["exp_ret"])
-    return snap, calendar
+    return snap, calendar, prices
 
 
 def cmd_signal(cfg: Config, args) -> None:
     from .signals import entry_ok
 
-    snap, calendar = _snapshot(cfg)
+    snap, calendar, _ = _snapshot(cfg)
     snap["entry"] = [entry_ok(row, cfg.strategy) for _, row in snap.iterrows()]
     snap["stop"] = snap["close"] - cfg.strategy.stop_atr * snap["atr14"]
     cols = ["close", "p_up", "exp_ret", "pred_close", "stop", "entry"]
@@ -190,6 +212,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--sweep", action="store_true", help="Run the parameter sensitivity grid")
     p.add_argument("--label", default=None)
     p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser("evaluate", help="Pass/fail check of the edge against no-skill controls")
+    p.add_argument("--predictions", default=None)
+    p.add_argument("--shuffled", default=None, help="Predictions from `train --shuffle-labels`")
+    p.add_argument("--controls", type=int, default=None, help="Permuted-score control runs (default from config)")
+    p.add_argument("--jobs", type=int, default=-1, help="Parallel backtests; -1 uses every core")
+    p.set_defaults(func=cmd_evaluate)
 
     p = sub.add_parser("signal", help="Score the latest close and show entry candidates")
     p.add_argument("--top", type=int, default=20)

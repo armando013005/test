@@ -52,13 +52,29 @@ def size_position(
 
 
 class DrawdownGuard:
-    """Blocks new entries while equity sits more than `max_drawdown_halt` below its peak."""
+    """Blocks new entries while equity sits more than `max_drawdown_halt` below its peak.
 
-    def __init__(self, cfg: RiskConfig, peak: float | None = None):
+    After `halt_cooldown_days` consecutive halted days the guard re-arms: the
+    peak resets to current equity and entries resume. Without the reset, an
+    account that has closed its positions sits flat in cash, can never climb
+    back above the threshold, and stops trading forever.
+    """
+
+    def __init__(self, cfg: RiskConfig, peak: float | None = None, halted_days: int = 0):
         self.limit = cfg.max_drawdown_halt
+        self.cooldown = cfg.halt_cooldown_days
         self.peak = peak if peak is not None else cfg.initial_equity
+        self.halted_days = halted_days
 
     def update(self, equity: float) -> bool:
-        """Records equity and returns True when new entries are allowed."""
+        """Records one day's equity and returns True when new entries are allowed."""
         self.peak = max(self.peak, equity)
-        return equity >= self.peak * (1 - self.limit)
+        if equity >= self.peak * (1 - self.limit):
+            self.halted_days = 0
+            return True
+        self.halted_days += 1
+        if self.cooldown and self.halted_days > self.cooldown:
+            self.peak = equity
+            self.halted_days = 0
+            return True
+        return False

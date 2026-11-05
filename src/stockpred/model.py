@@ -160,14 +160,37 @@ def fit_final(panel: pd.DataFrame, cfg: ModelConfig, seed: int = 0) -> FittedMod
     return fit_model(labeled[labeled.index.get_level_values("date") >= start], cfg, seed=seed)
 
 
-def oos_metrics(preds: pd.DataFrame) -> dict[str, float]:
-    """Out-of-sample classification and ranking quality."""
+def _tstat(x: pd.Series) -> float:
+    x = x.dropna()
+    if len(x) < 3 or x.std(ddof=1) == 0:
+        return float("nan")
+    return float(x.mean() / x.std(ddof=1) * np.sqrt(len(x)))
+
+
+def oos_metrics(preds: pd.DataFrame, horizon: int = 5) -> dict[str, float]:
+    """Out-of-sample classification, ranking, and price-forecast quality.
+
+    Daily statistics are cross-sectional: they compare stocks with each other
+    on the same day. T-stats use every `horizon`-th day so that the 5-day
+    forward returns behind consecutive observations don't overlap.
+    """
     scored = preds.dropna(subset=["label", "fwd_ret"])
     y, p = scored["label"].to_numpy(), scored["p_up"].clip(1e-6, 1 - 1e-6).to_numpy()
     base_rate = float(y.mean())
-    ic_by_day = scored.groupby(level="date").apply(
-        lambda g: spearmanr(g["p_up"], g["fwd_ret"]).statistic if len(g) > 5 else np.nan
-    )
+
+    ic, reg_ic, spread = {}, {}, {}
+    for date, g in scored.groupby(level="date"):
+        if len(g) < 10 or g["p_up"].nunique() < 2:
+            continue
+        ic[date] = spearmanr(g["p_up"], g["fwd_ret"]).statistic
+        if g["exp_ret"].nunique() > 1:
+            reg_ic[date] = spearmanr(g["exp_ret"], g["fwd_ret"]).statistic
+        q = g["p_up"].rank(pct=True)
+        spread[date] = g.loc[q > 0.8, "fwd_ret"].mean() - g.loc[q <= 0.2, "fwd_ret"].mean()
+    ic, reg_ic, spread = (pd.Series(d, dtype=float).sort_index() for d in (ic, reg_ic, spread))
+
+    # The regressor's price forecast versus the naive "price stays the same" forecast.
+    e, f = scored["exp_ret"], scored["fwd_ret"]
     return {
         "rows": int(len(scored)),
         "auc": float(roc_auc_score(y, p)),
@@ -175,5 +198,12 @@ def oos_metrics(preds: pd.DataFrame) -> dict[str, float]:
         "log_loss_base_rate": float(log_loss(y, np.full_like(p, base_rate))),
         "hit_rate": float(((p > 0.5) == (y == 1)).mean()),
         "base_rate": base_rate,
-        "mean_daily_rank_ic": float(np.nanmean(ic_by_day)),
+        "mean_daily_rank_ic": float(ic.mean()),
+        "rank_ic_tstat": _tstat(ic.iloc[::horizon]),
+        "ic_days": int(len(ic)),
+        "top_bottom_quintile_bps": float(spread.mean() * 1e4),
+        "quintile_spread_tstat": _tstat(spread.iloc[::horizon]),
+        "reg_rank_ic": float(reg_ic.mean()),
+        "reg_r2_vs_no_change": float(1 - ((f - e) ** 2).sum() / (f**2).sum()),
+        "reg_sign_hit_rate": float((np.sign(e) == np.sign(f)).mean()),
     }

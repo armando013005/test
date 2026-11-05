@@ -106,6 +106,7 @@ risk:
   max_positions: 8
   max_sector_pct: 0.25
   max_drawdown_halt: 0.15      # Block new entries while drawdown exceeds this.
+  halt_cooldown_days: 20       # After this many halted days, reset the peak and resume.
   vol_target: null             # Annualized market vol target, for example 0.15. null disables.
 
 costs:
@@ -123,3 +124,19 @@ sweep:
 paths:
   artifacts: artifacts
   state: state/live.json
+
+# Pass/fail gates for `stockpred evaluate`. Set before seeing any real results;
+# changing them afterwards defeats the purpose.
+evaluation:
+  controls: 20                 # Backtests with scores shuffled across tickers (no skill).
+  seed: 0
+  max_leak_ic: 0.01            # Shuffled-label model: |mean daily rank IC| below this.
+  max_leak_auc_dev: 0.01       # Shuffled-label model: |AUC - 0.5| below this.
+  min_rank_ic: 0.02            # Real model: mean daily rank IC at least this...
+  min_ic_tstat: 2.0            # ...with a t-stat (non-overlapping days) at least this.
+  control_percentile: 0.95     # Strategy Sharpe beats this share of the controls.
+  stress_cost_mult: 2.0
+  min_stress_sharpe: 0.0       # Sharpe at 2x costs above this.
+  min_sweep_positive_frac: 0.75  # Share of sweep cells with Sharpe > 0.
+  max_drawdown: 0.25
+  min_trades: 100
