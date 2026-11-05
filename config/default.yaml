@@ -1,0 +1,125 @@
+# Every tunable rule lives here. Override with: stockpred --config my.yaml <command>
+
+data:
+  start: "2005-01-01"
+  cache_dir: data/cache
+  benchmark: SPY
+  min_history_days: 600        # Tickers with less history are dropped.
+  max_missing_frac: 0.02       # Tickers missing more benchmark days than this are dropped.
+
+# Liquid large caps plus index ETFs. Sector drives the per-sector exposure cap.
+universe:
+  SPY: ETF
+  QQQ: ETF
+  AAPL: Technology
+  MSFT: Technology
+  NVDA: Technology
+  AVGO: Technology
+  ORCL: Technology
+  CSCO: Technology
+  ADBE: Technology
+  CRM: Technology
+  INTC: Technology
+  AMD: Technology
+  QCOM: Technology
+  TXN: Technology
+  GOOGL: Communication
+  META: Communication
+  NFLX: Communication
+  DIS: Communication
+  VZ: Communication
+  AMZN: ConsumerDiscretionary
+  TSLA: ConsumerDiscretionary
+  HD: ConsumerDiscretionary
+  MCD: ConsumerDiscretionary
+  NKE: ConsumerDiscretionary
+  LOW: ConsumerDiscretionary
+  SBUX: ConsumerDiscretionary
+  PG: ConsumerStaples
+  KO: ConsumerStaples
+  PEP: ConsumerStaples
+  WMT: ConsumerStaples
+  COST: ConsumerStaples
+  JPM: Financials
+  BAC: Financials
+  WFC: Financials
+  GS: Financials
+  MS: Financials
+  V: Financials
+  MA: Financials
+  BRK-B: Financials
+  UNH: HealthCare
+  JNJ: HealthCare
+  LLY: HealthCare
+  PFE: HealthCare
+  MRK: HealthCare
+  ABT: HealthCare
+  TMO: HealthCare
+  XOM: Energy
+  CVX: Energy
+  COP: Energy
+  CAT: Industrials
+  HON: Industrials
+  UNP: Industrials
+  GE: Industrials
+  NEE: Utilities
+  LIN: Materials
+
+model:
+  horizon: 5                   # Forecast horizon in trading days.
+  label_threshold: 0.002       # Target must beat round-trip costs to count as "up".
+  label_mode: cross_sectional  # Beat the daily median of the universe. Also: excess (vs benchmark), absolute.
+  train_years: 5               # Rolling training window.
+  retrain_months: 3            # Walk-forward step.
+  embargo_days: 2              # Extra gap on top of the horizon purge.
+  calib_frac: 0.2              # Tail of each training window used for probability calibration.
+  min_train_rows: 5000
+  lgbm:
+    n_estimators: 300
+    learning_rate: 0.03
+    num_leaves: 15
+    max_depth: 4
+    min_child_samples: 200
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 5.0
+    verbose: -1
+
+strategy:
+  # Entry: every condition must hold at the signal close; fill at the next open.
+  entry_prob: 0.55             # Calibrated probability; label base rate is ~0.46, so this is a high bar.
+  require_above_sma200: true
+  require_market_above_sma200: true
+  min_dollar_volume: 20000000  # Median 60-day dollar volume.
+  earnings_blackout_days: 3    # Live only; yfinance has no point-in-time earnings history.
+  # Exits: first one triggered wins.
+  stop_atr: 2.0                # Initial stop = entry - stop_atr * ATR.
+  trail_atr: 3.0               # Trailing stop = highest close - trail_atr * ATR.
+  time_stop_days: 10
+  exit_prob: 0.42              # Model flip exit (about the 10th percentile of p_up).
+
+risk:
+  initial_equity: 100000
+  risk_per_trade: 0.005        # Fraction of equity lost if the initial stop is hit.
+  max_position_pct: 0.10
+  max_positions: 8
+  max_sector_pct: 0.25
+  max_drawdown_halt: 0.15      # Block new entries while drawdown exceeds this.
+  vol_target: null             # Annualized market vol target, for example 0.15. null disables.
+
+costs:
+  commission_per_share: 0.005
+  min_commission: 1.0
+  max_commission_pct: 0.01     # Commission cap as a fraction of trade value.
+  half_spread_bps: 2.0
+  slippage_coef: 0.1           # Slippage = coef * ATR% * sqrt(participation).
+  multiplier: 1.0              # Stress test with 2.0.
+
+sweep:
+  entry_prob: [0.52, 0.55, 0.58]
+  stop_atr: [1.5, 2.0, 3.0]
+
+paths:
+  artifacts: artifacts
+  state: state/live.json
